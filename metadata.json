@@ -1,0 +1,7 @@
+{
+  "name": "Copy of Pesquisa por localização - Pesquisa Inteligente Triad3 - 93% oficial",
+  "description": "Pesquisa Inteligente Triad3",
+  "requestFramePermissions": [
+    "geolocation"
+  ]
+}
