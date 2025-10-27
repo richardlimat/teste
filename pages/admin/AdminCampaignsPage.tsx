@@ -2,7 +2,7 @@
 import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import type { Campaign, Company, Voucher } from '../../types';
-import { getPaginatedCampaigns, getCompanies, getVouchers } from '../../services/api';
+import { getPaginatedCampaigns, getCompanies, getVouchers, getCampaignById } from '../../services/api';
 import { supabase } from '../../services/supabase';
 import Modal from '../../components/Modal';
 import QRCodeDisplay from '../../components/QRCodeDisplay';
@@ -19,6 +19,7 @@ import LoadingSpinner from '../../components/LoadingSpinner';
 import { BuildingOfficeIcon } from '../../components/icons/BuildingOfficeIcon';
 import PaginationControls from '../../components/PaginationControls';
 import AssignCompaniesModal from '../../components/AssignCompaniesModal';
+import { DocumentDuplicateIcon } from '../../components/icons/DocumentDuplicateIcon';
 
 const PAGE_SIZE = 10;
 
@@ -47,6 +48,7 @@ const AdminCampaignsPage: React.FC = () => {
     const [isCompanyModalOpen, setIsCompanyModalOpen] = useState(false);
     const [campaignToDelete, setCampaignToDelete] = useState<Campaign | null>(null);
     const [campaignToToggle, setCampaignToToggle] = useState<Campaign | null>(null);
+    const [campaignToDuplicate, setCampaignToDuplicate] = useState<Campaign | null>(null);
     const [selectedCampaignForQr, setSelectedCampaignForQr] = useState<Campaign | null>(null);
     const [selectedCampaignForCompanies, setSelectedCampaignForCompanies] = useState<Campaign | null>(null);
     const navigate = useNavigate();
@@ -127,6 +129,94 @@ const AdminCampaignsPage: React.FC = () => {
                  setCampaigns(campaigns.map(c => c.id === campaignToToggle.id ? { ...c, isActive: newStatus } : c));
             }
             setCampaignToToggle(null);
+        }
+    };
+
+    const handleDuplicateClick = (campaign: Campaign) => {
+        setCampaignToDuplicate(campaign);
+    };
+
+    const confirmDuplicate = async () => {
+        if (!campaignToDuplicate) return;
+        
+        setIsLoading(true);
+        try {
+            const originalCampaign = await getCampaignById(campaignToDuplicate.id);
+            if (!originalCampaign) throw new Error("Campanha original não encontrada.");
+            
+            const newCampaignDataForDb = {
+                nome: `Cópia de ${originalCampaign.name.replace(/^Cópia de /, '')}`,
+                descricao: originalCampaign.description,
+                tema: originalCampaign.theme,
+                texto_lgpd: originalCampaign.lgpdText,
+                esta_ativa: false, // Always start as inactive
+                coletar_info_usuario: originalCampaign.collectUserInfo,
+                meta_respostas: originalCampaign.responseGoal,
+                data_inicio: originalCampaign.startDate,
+                data_fim: originalCampaign.endDate,
+                hora_inicio: originalCampaign.startTime,
+                hora_fim: originalCampaign.endTime,
+                url_redirecionamento_final: originalCampaign.finalRedirectUrl,
+            };
+    
+            const { data: newCampaign, error: campaignError } = await supabase.from('campanhas').insert(newCampaignDataForDb).select('id').single();
+            if (campaignError || !newCampaign) throw new Error(campaignError?.message || "Erro ao criar a cópia da campanha.");
+            const newCampaignId = newCampaign.id;
+    
+            if (originalCampaign.questions && originalCampaign.questions.length > 0) {
+                const oldToNewQuestionIdMap = new Map<string, string>();
+                const questionsToInsert = originalCampaign.questions.map((q, index) => ({
+                    id_campanha: newCampaignId,
+                    texto: q.text,
+                    tipo: q.type,
+                    permitir_multiplas_respostas: q.allowMultipleAnswers || false,
+                    ordem: index,
+                }));
+                const { data: newQuestions, error: questionsError } = await supabase.from('perguntas').insert(questionsToInsert).select('id');
+                if (questionsError || !newQuestions) throw new Error(questionsError?.message || "Erro ao duplicar perguntas.");
+    
+                originalCampaign.questions.forEach((q, index) => oldToNewQuestionIdMap.set(q.id, newQuestions[index].id));
+    
+                const optionsToInsert = originalCampaign.questions.flatMap((q, qIndex) =>
+                    (q.options || []).map((opt, oIndex) => ({
+                        id_pergunta: newQuestions[qIndex].id,
+                        valor: opt.value,
+                        pular_para_pergunta: opt.jumpTo && opt.jumpTo !== 'END_SURVEY' ? oldToNewQuestionIdMap.get(opt.jumpTo) || null : null,
+                        pular_para_final: opt.jumpTo === 'END_SURVEY',
+                        ordem: oIndex
+                    }))
+                );
+                if (optionsToInsert.length > 0) {
+                    const { error: optionsError } = await supabase.from('opcoes_perguntas').insert(optionsToInsert);
+                    if (optionsError) throw new Error(optionsError.message || "Erro ao duplicar opções.");
+                }
+            }
+            
+            if (originalCampaign.companyIds && originalCampaign.companyIds.length > 0) {
+                await supabase.from('campanhas_empresas').insert(originalCampaign.companyIds.map(id => ({ id_campanha: newCampaignId, id_empresa: id })));
+            }
+    
+            if (originalCampaign.researcherIds && originalCampaign.researcherIds.length > 0) {
+                await supabase.from('campanhas_pesquisadores').insert(originalCampaign.researcherIds.map(id => ({ id_campanha: newCampaignId, id_pesquisador: id })));
+            }
+    
+            if (originalCampaign.activationPoints && originalCampaign.activationPoints.length > 0) {
+                await supabase.from('pontos_ativacao').insert(originalCampaign.activationPoints.map(p => ({
+                    id_campanha: newCampaignId,
+                    latitude: p.latitude,
+                    longitude: p.longitude,
+                    raio_metros: p.radius,
+                })));
+            }
+    
+            alert("Campanha duplicada com sucesso!");
+            setCurrentPage(0); // Go to first page to see the new campaign
+            fetchData(0, { status: campaignStatusFilter, companyId: companyFilterId, searchQuery });
+        } catch (error) {
+            alert(`Falha ao duplicar campanha: ${error.message}`);
+        } finally {
+            setCampaignToDuplicate(null);
+            setIsLoading(false);
         }
     };
 
@@ -285,6 +375,15 @@ const AdminCampaignsPage: React.FC = () => {
               )}
             </Modal>
 
+            <Modal isOpen={!!campaignToDuplicate} onClose={() => setCampaignToDuplicate(null)} title="Confirmar Duplicação">
+                <p>Tem certeza que deseja duplicar a campanha "<strong>{campaignToDuplicate?.name}</strong>"?</p>
+                <p className="text-sm text-gray-500 mt-2">Uma nova campanha inativa será criada com todas as configurações, perguntas e vínculos.</p>
+                <div className="flex justify-end gap-4 mt-6">
+                    <button onClick={() => setCampaignToDuplicate(null)} className="px-4 py-2 bg-gray-300 dark:bg-gray-600 rounded-lg hover:opacity-90">Cancelar</button>
+                    <button onClick={confirmDuplicate} className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:opacity-90">Sim, Duplicar</button>
+                </div>
+            </Modal>
+
             <div className="space-y-4">
                 {campaigns.map(campaign => {
                     const isCampaignExpanded = expandedCampaignId === campaign.id;
@@ -321,6 +420,9 @@ const AdminCampaignsPage: React.FC = () => {
                                     <div className="flex items-center gap-1">
                                         <button onClick={(e) => { e.stopPropagation(); handleOpenCompanyModal(campaign); }} className="p-2 text-gray-500 hover:text-dark-secondary hover:bg-gray-100 dark:hover:bg-dark-border rounded-full transition-colors" title="Vincular Empresas">
                                             <BuildingOfficeIcon className="h-5 w-5"/>
+                                        </button>
+                                        <button onClick={(e) => { e.stopPropagation(); handleDuplicateClick(campaign); }} className="p-2 text-gray-500 hover:text-blue-500 hover:bg-gray-100 dark:hover:bg-dark-border rounded-full transition-colors" title="Duplicar Campanha">
+                                            <DocumentDuplicateIcon className="h-5 w-5"/>
                                         </button>
                                         <button onClick={(e) => { e.stopPropagation(); navigate(`/admin/campaigns/edit/${campaign.id}`); }} className="p-2 text-gray-500 hover:text-light-primary hover:bg-gray-100 dark:hover:bg-dark-border rounded-full transition-colors"><PencilIcon className="h-5 w-5"/></button>
                                         <button onClick={(e) => { e.stopPropagation(); handleDeleteClick(campaign); }} className="p-2 text-gray-500 hover:text-error hover:bg-gray-100 dark:hover:bg-dark-border rounded-full transition-colors"><TrashIcon className="h-5 w-5"/></button>
